@@ -134,6 +134,53 @@ def migrar_a_oracle():
         conn.commit()
         print(f"✅ {len(datos_det)} líneas de detalle migradas.\n")
 
+
+        # 4. Migrar Detalle Compras Históricas (DTFACC.DBF)
+        try:
+            ruta_dtfacc = encontrar_archivo(CARPETA_DATOS, "DTFACC")
+            print(f"📖 Leyendo {os.path.basename(ruta_dtfacc)}...")
+            df_dtfacc = pd.DataFrame(iter(DBF(ruta_dtfacc, encoding='latin1', ignore_missing_memofile=True)))
+
+            # Crear o vaciar la tabla de historial de costos
+            try:
+                cursor.execute("""
+                    CREATE TABLE detalle_compras (
+                        rut_prov VARCHAR2(30),
+                        fecha DATE,
+                        tipo VARCHAR2(5),
+                        numero VARCHAR2(20),
+                        cod_art VARCHAR2(30),
+                        cantid NUMBER(15,4),
+                        precio NUMBER(15,4)
+                    )
+                """)
+            except oracledb.DatabaseError:
+                cursor.execute("TRUNCATE TABLE detalle_compras")
+
+            sql_comp = """
+                INSERT INTO detalle_compras (rut_prov, fecha, tipo, numero, cod_art, cantid, precio)
+                VALUES (:1, TO_DATE(:2, 'YYYY-MM-DD'), :3, :4, :5, :6, :7)
+            """
+            datos_comp = []
+            for _, r in df_dtfacc.iterrows():
+                f_str = r['FECHA'].strftime('%Y-%m-%d') if pd.notnull(r['FECHA']) else None
+                if f_str:
+                    datos_comp.append((
+                        str(r['RUTPROV']).strip() if pd.notnull(r['RUTPROV']) else None,
+                        f_str,
+                        str(r['TIPO']).strip() if pd.notnull(r['TIPO']) else None,
+                        str(r['NUMERO']).strip() if pd.notnull(r['NUMERO']) else None,
+                        str(r['COD_ART']).strip() if pd.notnull(r['COD_ART']) else None,
+                        float(r['CANTID']) if pd.notnull(r['CANTID']) else 0.0,
+                        float(r['PRECIO']) if pd.notnull(r['PRECIO']) else 0.0
+                    ))
+
+            cursor.executemany(sql_comp, datos_comp)
+            conn.commit()
+            print(f"✅ {len(datos_comp)} líneas de historial de costos migradas.\n")
+        except FileNotFoundError:
+            print("⚠️ Archivo DTFACC.dbf no encontrado. Se omitió el historial de compras.")
+
         print("🎉 ¡Migración completa a Oracle finalizada exitosamente!")
 
     except Exception as e:

@@ -4,6 +4,7 @@ import shutil
 from datetime import datetime
 from dbfread import DBF
 import oracledb
+import pandas as pd  
 
 # ==========================================================
 # CONFIGURACIÓN DE CONEXIÓN ORACLE
@@ -60,7 +61,22 @@ def sincronizar_todo_a_oracle(carpeta_origen):
                 except Exception as e:
                     print(f"⚠️ Aviso al leer {nom_dbf}: {e}")
 
-        cursor.execute("TRUNCATE TABLE clientes")
+        try:
+            cursor.execute("""
+                CREATE TABLE clientes (
+                    rut_cliente VARCHAR2(30) PRIMARY KEY,
+                    nombre      VARCHAR2(150) NOT NULL,
+                    direccion   VARCHAR2(150),
+                    comuna      VARCHAR2(50),
+                    ciudad      VARCHAR2(50),
+                    giro        VARCHAR2(100),
+                    telefono    VARCHAR2(50),
+                    email       VARCHAR2(100)
+                )
+            """)
+        except oracledb.DatabaseError:
+            cursor.execute("TRUNCATE TABLE clientes")
+
         sql_cli = """
             INSERT INTO clientes (rut_cliente, nombre, direccion, comuna, ciudad, giro, telefono, email)
             VALUES (:1, :2, :3, :4, :5, :6, :7, :8)
@@ -69,27 +85,63 @@ def sincronizar_todo_a_oracle(carpeta_origen):
         for i in range(0, len(lista_cli), BATCH_SIZE):
             cursor.executemany(sql_cli, lista_cli[i:i + BATCH_SIZE])
         conn.commit()
-        print(f"✅ {len(lista_cli):,} clientes y compradores migrados (incluido TTM Service SpA).")
+        print(f"✅ {len(lista_cli):,} clientes y compradores migrados.")
 
         # 2. VENDEDORES (VENDED.DBF)
         ruta_ven = buscar_archivo_dbf(carpeta_origen, "VENDED")
         if ruta_ven:
             print("📖 Cargando VENDED.DBF...")
-            cursor.execute("TRUNCATE TABLE vendedores")
+            try:
+                cursor.execute("""
+                    CREATE TABLE vendedores (
+                        cod_vendedor VARCHAR2(10) PRIMARY KEY,
+                        nombre VARCHAR2(100),
+                        tasa_general NUMBER(6,4),
+                        comisiona_individual NUMBER(1) DEFAULT 1
+                    )
+                """)
+            except oracledb.DatabaseError:
+                pass # Si existe, no truncamos para no perder la configuración manual de tasas y pozo, usamos MERGE
+            
             dict_ven = {}
             for r in DBF(ruta_ven, encoding='latin1', ignore_missing_memofile=True):
                 cod = str(r['CODVEN']).strip()
                 nom = str(r['NOMBRE']).strip()
-                es_fer = "FERNANDA" in nom.upper() or cod.upper() in ["FER", "FD", "FND"]
-                dict_ven[cod] = (cod, nom, 0.0 if es_fer else 0.02, 0.0025 if es_fer else 0.02, 1 if es_fer else 0)
-            cursor.executemany("INSERT INTO vendedores VALUES (:1, :2, :3, :4, :5)", list(dict_ven.values()))
+                dict_ven[cod] = (cod, nom)
+            
+            sql_ven = """
+                MERGE INTO vendedores dst
+                USING (SELECT :1 AS cod_vendedor, :2 AS nombre FROM dual) src
+                ON (dst.cod_vendedor = src.cod_vendedor)
+                WHEN MATCHED THEN
+                    UPDATE SET dst.nombre = src.nombre
+                WHEN NOT MATCHED THEN
+                    INSERT (cod_vendedor, nombre, tasa_general, comisiona_individual)
+                    VALUES (src.cod_vendedor, src.nombre, 0.02, 1)
+            """
+            cursor.executemany(sql_ven, list(dict_ven.values()))
             conn.commit()
+            print(f"✅ Vendedores actualizados conservando su configuración previa.")
 
         # 3. CATÁLOGO DE PRODUCTOS (PRODUC.DBF)
         ruta_prod = buscar_archivo_dbf(carpeta_origen, "PRODUC")
         if ruta_prod:
             print("📖 Cargando PRODUC.DBF...")
-            cursor.execute("TRUNCATE TABLE productos")
+            try:
+                cursor.execute("""
+                    CREATE TABLE productos (
+                        cod_producto VARCHAR2(30) PRIMARY KEY,
+                        descripcion VARCHAR2(150),
+                        precio_costo NUMBER(15,4),
+                        precio_venta NUMBER(15,4),
+                        precio_ult_compra NUMBER(15,4),
+                        fecha_ult_compra DATE,
+                        familia VARCHAR2(50)
+                    )
+                """)
+            except oracledb.DatabaseError:
+                cursor.execute("TRUNCATE TABLE productos")
+                
             dict_prod = {}
             for r in DBF(ruta_prod, encoding='latin1', ignore_missing_memofile=True):
                 cod = str(r['CODIGO']).strip()
@@ -116,9 +168,37 @@ def sincronizar_todo_a_oracle(carpeta_origen):
         ruta_dtf = buscar_archivo_dbf(carpeta_origen, "DTFACV")
         if ruta_tif and ruta_dtf:
             print("📖 Cargando TIFACV.DBF y DTFACV.DBF...")
-            cursor.execute("TRUNCATE TABLE detalle_venta")
-            cursor.execute("DELETE FROM documentos_venta")
-            conn.commit()
+            try:
+                cursor.execute("""
+                    CREATE TABLE documentos_venta (
+                        tipo_doc VARCHAR2(5),
+                        numero_doc VARCHAR2(20),
+                        fecha DATE,
+                        rut_cliente VARCHAR2(30),
+                        cod_vendedor VARCHAR2(10),
+                        pdesct1 NUMBER(8,4),
+                        descto1 NUMBER(15,4),
+                        neto NUMBER(15,4),
+                        iva NUMBER(15,4),
+                        estado VARCHAR2(20),
+                        PRIMARY KEY (tipo_doc, numero_doc)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE detalle_venta (
+                        tipo_doc VARCHAR2(5),
+                        numero_doc VARCHAR2(20),
+                        fecha DATE,
+                        cod_producto VARCHAR2(30),
+                        cantidad NUMBER(15,4),
+                        precio NUMBER(15,4),
+                        descto NUMBER(8,4)
+                    )
+                """)
+            except oracledb.DatabaseError:
+                cursor.execute("TRUNCATE TABLE detalle_venta")
+                cursor.execute("DELETE FROM documentos_venta")
+                conn.commit()
 
             docs_unicos = {}
             for r in DBF(ruta_tif, encoding='latin1', ignore_missing_memofile=True):
@@ -167,7 +247,52 @@ def sincronizar_todo_a_oracle(carpeta_origen):
             conn.commit()
             print(f"✅ {len(detalles_v):,} líneas de venta migradas.")
 
+        # 5. HISTORIAL DE COSTOS DE COMPRAS (DTFACC.DBF)
+        ruta_dtfacc = buscar_archivo_dbf(carpeta_origen, "DTFACC")
+        if ruta_dtfacc:
+            print("📖 Cargando DTFACC.DBF (Historial de Costos)...")
+            try:
+                cursor.execute("""
+                    CREATE TABLE detalle_compras (
+                        rut_prov VARCHAR2(30),
+                        fecha DATE,
+                        tipo VARCHAR2(5),
+                        numero VARCHAR2(20),
+                        cod_art VARCHAR2(30),
+                        cantid NUMBER(15,4),
+                        precio_costo NUMBER(15,4)
+                    )
+                """)
+            except oracledb.DatabaseError:
+                cursor.execute("TRUNCATE TABLE detalle_compras")
+
+            sql_comp = """
+                INSERT INTO detalle_compras (rut_prov, fecha, tipo, numero, cod_art, cantid, precio_costo)
+                VALUES (:1, TO_DATE(:2, 'YYYY-MM-DD'), :3, :4, :5, :6, :7)
+            """
+            datos_comp = []
+            for r in DBF(ruta_dtfacc, encoding='latin1', ignore_missing_memofile=True):
+                f_str = r['FECHA'].strftime('%Y-%m-%d') if r.get('FECHA') else None
+                if f_str:
+                    datos_comp.append((
+                        str(r['RUTPROV']).strip() if pd.notnull(r['RUTPROV']) else None,
+                        f_str,
+                        str(r['TIPO']).strip() if pd.notnull(r['TIPO']) else None,
+                        str(r['NUMERO']).strip() if pd.notnull(r['NUMERO']) else None,
+                        str(r['COD_ART']).strip() if pd.notnull(r['COD_ART']) else None,
+                        float(r['CANTID']) if pd.notnull(r['CANTID']) else 0.0,
+                        float(r['PRECIO']) if pd.notnull(r['PRECIO']) else 0.0
+                    ))
+
+            for i in range(0, len(datos_comp), BATCH_SIZE):
+                cursor.executemany(sql_comp, datos_comp[i:i + BATCH_SIZE])
+            conn.commit()
+            print(f"✅ {len(datos_comp):,} líneas de historial de costos migradas.\n")
+        else:
+            print("⚠️ Archivo DTFACC.dbf no encontrado.")
+
         print("\n🎉 ¡Sincronización completa con catálogo y clientes finalizada!")
+
 
     except Exception as e:
         conn.rollback()

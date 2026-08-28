@@ -192,25 +192,50 @@ def extraer_datos_base_oracle(fecha_inicio, fecha_fin):
         NVL(p.descripcion, 'SIN DESCRIPCIÓN') AS descripcion_producto,
         (d.cantidad * (CASE WHEN d.tipo_doc = '61' THEN -1.0 ELSE 1.0 END)) AS cant,
         d.precio AS precio_orig,
-        NVL(p.precio_costo, 0.0) AS costo_unitario,
+        
+        -- COSTO HISTÓRICO APUNTANDO A detalle_compras
+        NVL(
+            (SELECT MAX(h.precio_costo) KEEP (DENSE_RANK FIRST ORDER BY h.fecha DESC) 
+             FROM detalle_compras h 
+             WHERE h.cod_art = d.cod_producto AND h.fecha <= d.fecha AND h.precio_costo > 0),
+            NVL(p.precio_costo, 0.0)
+        ) AS costo_unitario,
+
         ROUND((NVL(d.descto, 0) + NVL(doc.pdesct1, 0)), 2) AS desc_porc,
         ROUND(d.precio * (1 - (NVL(d.descto, 0)/100.0)) * (1 - (NVL(doc.pdesct1, 0)/100.0)), 2) AS precio_final,
+        
         ROUND((d.cantidad * d.precio * (1 - (NVL(d.descto, 0)/100.0)) * (1 - (NVL(doc.pdesct1, 0)/100.0))) * 
         (CASE WHEN d.tipo_doc = '61' THEN -1.0 ELSE 1.0 END), 2) AS tot_venta,
-        ROUND((d.cantidad * NVL(p.precio_costo, 0.0)) * 
-        (CASE WHEN d.tipo_doc = '61' THEN -1.0 ELSE 1.0 END), 2) AS tot_costo,
+        
+        -- TOTAL COSTO USANDO EL HISTÓRICO
+        ROUND((d.cantidad * 
+            NVL(
+                (SELECT MAX(h.precio_costo) KEEP (DENSE_RANK FIRST ORDER BY h.fecha DESC) 
+                 FROM detalle_compras h 
+                 WHERE h.cod_art = d.cod_producto AND h.fecha <= d.fecha AND h.precio_costo > 0),
+                NVL(p.precio_costo, 0.0)
+            )
+        ) * (CASE WHEN d.tipo_doc = '61' THEN -1.0 ELSE 1.0 END), 2) AS tot_costo,
+        
+        -- GANANCIA TOTAL USANDO EL HISTÓRICO
         ROUND(((d.cantidad * d.precio * (1 - (NVL(d.descto, 0)/100.0)) * (1 - (NVL(doc.pdesct1, 0)/100.0))) - 
-               (d.cantidad * NVL(p.precio_costo, 0.0))) * 
+               (d.cantidad * 
+                    NVL(
+                        (SELECT MAX(h.precio_costo) KEEP (DENSE_RANK FIRST ORDER BY h.fecha DESC) 
+                         FROM detalle_compras h 
+                         WHERE h.cod_art = d.cod_producto AND h.fecha <= d.fecha AND h.precio_costo > 0),
+                        NVL(p.precio_costo, 0.0)
+                    )
+               )) * 
               (CASE WHEN d.tipo_doc = '61' THEN -1.0 ELSE 1.0 END), 2) AS ganancia_total,
+              
         doc.cod_vendedor,
         v.nombre AS nombre_vendedor_original,
         v.tasa_general,
         NVL(v.comisiona_individual, 1) AS comisiona_individual,
         aj.porc_comis AS porc_comis_ajuste,
         CASE 
-            WHEN srv.rut_cliente IS NOT NULL THEN 1
-            WHEN UPPER(NVL(c.nombre, '')) LIKE '%SERVICE%' OR UPPER(NVL(c.nombre, '')) LIKE '%SERVITECA%' THEN 1
-            WHEN UPPER(NVL(doc.rut_cliente, '')) LIKE '%SERVICE%' THEN 1
+            WHEN REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(doc.rut_cliente)), '.', ''), ' ', ''), '/00', ''), '-', '') = '769675477' THEN 1
             ELSE 0
         END AS es_ttm_service
     FROM detalle_venta d
@@ -220,8 +245,6 @@ def extraer_datos_base_oracle(fecha_inicio, fecha_fin):
         ON TRIM(doc.rut_cliente) = TRIM(c.rut_cliente)
         OR REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(doc.rut_cliente)), '.', ''), ' ', ''), '/00', ''), '-', '') = 
            REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(c.rut_cliente)), '.', ''), ' ', ''), '/00', ''), '-', '')
-    LEFT JOIN ttm_service_clientes srv
-        ON TRIM(doc.rut_cliente) = TRIM(srv.rut_cliente) AND srv.activo = 1
     LEFT JOIN productos p 
         ON d.cod_producto = p.cod_producto
     LEFT JOIN vendedores v 
@@ -276,7 +299,7 @@ def procesar_calculo_en_memoria(df_raw, df_ven_cfg, df_esp_cfg):
 
         if pd.notna(row['PORC_COMIS_AJUSTE']):
             tasa_final = float(row['PORC_COMIS_AJUSTE'])
-        elif str(row['PRODUCTO']).upper().startswith('SER_'):
+        elif str(row['PRODUCTO']).upper().startswith('SER_') or str(row['PRODUCTO']).upper().startswith('SER'):
             tasa_final = 0.0
 
         return cod_final, nom_final, tasa_final
@@ -300,12 +323,19 @@ def procesar_calculo_en_memoria(df_raw, df_ven_cfg, df_esp_cfg):
     df_total = df[cols_estandar].copy()
     df_total.rename(columns={'EMPLEADO_RES': 'EMPLEADO', 'PORC_COMIS_RES': 'PORC_COMIS', 'COD_VENDEDOR_RES': 'COD_VENDEDOR'}, inplace=True)
 
+    # Identificar si la línea es un servicio y qué documentos contienen servicios
+    df_total['ES_SERVICIO'] = df_total['PRODUCTO'].astype(str).str.upper().str.startswith('SER').astype(int)
+    docs_con_serv = set(df_total[df_total['ES_SERVICIO'] == 1]['NUMERO'].unique())
+    df_total['TIENE_SERVICIO'] = df_total['NUMERO'].isin(docs_con_serv).astype(int)
+
+    # 1. Comisiones (Vendedores Individuales + Pozo Común)
     # 1. Comisiones (Vendedores Individuales + Pozo Común)
     df_comis_det = df_total[df_total['ES_TTM_SERVICE'] == 0].copy()
 
     df_res_ven = df_comis_det.groupby(['COD_VENDEDOR', 'EMPLEADO']).agg(
         TOTAL_VENTAS_NETAS=('TOT_VENTA', lambda x: x[x > 0].sum()),
         TOTAL_NOTAS_CREDITO=('TOT_VENTA', lambda x: abs(x[x < 0].sum())),
+        TOTAL_COSTO=('TOT_COSTO', 'sum'), # <--- NUEVA COLUMNA DE COSTOS
         GANANCIA_TOTAL_MARGEN=('GANANCIA_TOTAL', 'sum'),
         TOTAL_COMISION_PAGAR=('PAGO_EMPLEADO', lambda x: max(0, x.sum())),
         GANANCIA_NETA_EMPRESA=('GANANCIA_EMPRESA', 'sum')
@@ -371,6 +401,24 @@ def guardar_ajuste_oracle(tipo_doc_raw, numero_doc, cod_prod, cod_ven, porc_comi
     cursor.close()
     conn.close()
 
+def guardar_ajustes_multiples_oracle(ajustes):
+    if not ajustes: return
+    conn = get_oracle_connection()
+    cursor = conn.cursor()
+    merge_sql = """
+    MERGE INTO comisiones_linea_ajustes dst
+    USING (SELECT :tipo_doc AS tipo_doc, :numero_doc AS numero_doc, :cod_producto AS cod_producto, :cod_vendedor AS cod_vendedor, :porc_comis AS porc_comis FROM dual) src
+    ON (dst.tipo_doc = src.tipo_doc AND dst.numero_doc = src.numero_doc AND dst.cod_producto = src.cod_producto AND dst.cod_vendedor = src.cod_vendedor)
+    WHEN MATCHED THEN
+        UPDATE SET dst.porc_comis = src.porc_comis
+    WHEN NOT MATCHED THEN
+        INSERT (tipo_doc, numero_doc, cod_producto, cod_vendedor, porc_comis)
+        VALUES (src.tipo_doc, src.numero_doc, src.cod_producto, src.cod_vendedor, src.porc_comis)
+    """
+    cursor.executemany(merge_sql, ajustes)
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 # ==========================================================
 # 3. INTERFAZ GRÁFICA TKINTER (CLASE PRINCIPAL)
@@ -482,6 +530,7 @@ class AppComisionesOracle(tk.Tk):
         self.crear_vista_config_especial()
 
     def crear_vista_resumen_comisiones(self):
+        # 1. BARRA DE ORDENAMIENTO
         frame_sort_bar = tk.Frame(self.subtab_resumen_c, bg="#ffffff", bd=1, relief="groove", padx=10, pady=5)
         frame_sort_bar.pack(fill="x", padx=10, pady=(6, 2))
 
@@ -490,8 +539,11 @@ class AppComisionesOracle(tk.Tk):
         btn_sort_v = ttk.Button(frame_sort_bar, text="🔝 Mayor Venta", command=lambda: self.ordenar_resumen_por("TOTAL_VENTAS_NETAS"))
         btn_sort_v.pack(side="left", padx=3)
 
-        btn_sort_nc = ttk.Button(frame_sort_bar, text="⚠️ Mayor Nota Crédito", command=lambda: self.ordenar_resumen_por("TOTAL_NOTAS_CREDITO"))
+        btn_sort_nc = ttk.Button(frame_sort_bar, text="⚠️ Mayor NC", command=lambda: self.ordenar_resumen_por("TOTAL_NOTAS_CREDITO"))
         btn_sort_nc.pack(side="left", padx=3)
+        
+        btn_sort_costo = ttk.Button(frame_sort_bar, text="📦 Mayor Costo", command=lambda: self.ordenar_resumen_por("TOTAL_COSTO"))
+        btn_sort_costo.pack(side="left", padx=3)
 
         btn_sort_m = ttk.Button(frame_sort_bar, text="💰 Mayor Margen", command=lambda: self.ordenar_resumen_por("GANANCIA_TOTAL_MARGEN"))
         btn_sort_m.pack(side="left", padx=3)
@@ -505,26 +557,31 @@ class AppComisionesOracle(tk.Tk):
         self.lbl_info_orden = tk.Label(frame_sort_bar, text="Ordenado: Mayor Venta Neta ▼", font=("Segoe UI", 8, "italic"), bg="#ffffff", fg="#6c757d")
         self.lbl_info_orden.pack(side="right", padx=10)
 
+        # 2. TABLA PRINCIPAL VENDEDORES
         frame_v = ttk.Frame(self.subtab_resumen_c)
         frame_v.pack(fill="both", expand=True, padx=10, pady=2)
 
-        cols_v = ("COD", "EMPLEADO", "VENTAS_NETAS", "NOTAS_CREDITO", "GANANCIA_TOTAL", "PAGO_EMPLEADO", "GANANCIA_EMPRESA")
-        self.tree_res_v = ttk.Treeview(frame_v, columns=cols_v, show="headings", height=7)
+        # SE AGREGÓ "COSTO_TOTAL"
+        cols_v = ("COD", "EMPLEADO", "VENTAS_NETAS", "NOTAS_CREDITO", "COSTO_TOTAL", "GANANCIA_TOTAL", "PAGO_EMPLEADO", "GANANCIA_EMPRESA")
+        self.tree_res_v = ttk.Treeview(frame_v, columns=cols_v, show="headings", height=5)
         
         self.tree_res_v.heading("COD", text="Cód", command=lambda: self.ordenar_resumen_por("COD_VENDEDOR"))
         self.tree_res_v.heading("EMPLEADO", text="Vendedor / Entidad", command=lambda: self.ordenar_resumen_por("EMPLEADO"))
         self.tree_res_v.heading("VENTAS_NETAS", text="Ventas Netas ($)", command=lambda: self.ordenar_resumen_por("TOTAL_VENTAS_NETAS"))
         self.tree_res_v.heading("NOTAS_CREDITO", text="Notas Crédito ($)", command=lambda: self.ordenar_resumen_por("TOTAL_NOTAS_CREDITO"))
+        self.tree_res_v.heading("COSTO_TOTAL", text="Costos Totales ($)", command=lambda: self.ordenar_resumen_por("TOTAL_COSTO"))
         self.tree_res_v.heading("GANANCIA_TOTAL", text="Ganancia / Margen ($)", command=lambda: self.ordenar_resumen_por("GANANCIA_TOTAL_MARGEN"))
         self.tree_res_v.heading("PAGO_EMPLEADO", text="Pago Comisión ($)", command=lambda: self.ordenar_resumen_por("TOTAL_COMISION_PAGAR"))
         self.tree_res_v.heading("GANANCIA_EMPRESA", text="Ganancia Empresa ($)", command=lambda: self.ordenar_resumen_por("GANANCIA_NETA_EMPRESA"))
 
-        self.tree_res_v.column("COD", width=60, anchor="center")
-        self.tree_res_v.column("EMPLEADO", width=250, anchor="w")
-        self.tree_res_v.column("VENTAS_NETAS", width=140, anchor="e")
-        self.tree_res_v.column("NOTAS_CREDITO", width=140, anchor="e")
-        self.tree_res_v.column("GANANCIA_TOTAL", width=150, anchor="e")
-        self.tree_res_v.column("PAGO_EMPLEADO", width=150, anchor="e")
+        # Anchos ajustados para que quepa todo
+        self.tree_res_v.column("COD", width=50, anchor="center")
+        self.tree_res_v.column("EMPLEADO", width=220, anchor="w")
+        self.tree_res_v.column("VENTAS_NETAS", width=120, anchor="e")
+        self.tree_res_v.column("NOTAS_CREDITO", width=120, anchor="e")
+        self.tree_res_v.column("COSTO_TOTAL", width=130, anchor="e")
+        self.tree_res_v.column("GANANCIA_TOTAL", width=140, anchor="e")
+        self.tree_res_v.column("PAGO_EMPLEADO", width=140, anchor="e")
         self.tree_res_v.column("GANANCIA_EMPRESA", width=150, anchor="e")
 
         self.tree_res_v.tag_configure('fila_pozo', background='#E2E3E5', font=("Segoe UI", 9, "bold"))
@@ -535,20 +592,7 @@ class AppComisionesOracle(tk.Tk):
         self.tree_res_v.pack(side="left", fill="both", expand=True)
         sb_v.pack(side="right", fill="y")
 
-        # PANEL CONSOLIDADO DINÁMICO
-        self.frame_totales_contador = tk.Frame(self.subtab_resumen_c, bg="#212529", padx=15, pady=10)
-        self.frame_totales_contador.pack(fill="x", padx=10, pady=(2, 8))
-
-        self.lbl_tot_contador = tk.Label(
-            self.frame_totales_contador, 
-            text="TOTAL A LIQUIDAR: $0  |  MARGEN TOTAL: $0  |  GANANCIA NETA EMPRESA: $0", 
-            font=("Segoe UI", 9, "bold"), 
-            bg="#212529", 
-            fg="#28A745"
-        )
-        self.lbl_tot_contador.pack(anchor="w")
-
-        # Tabla 2: Comisión Especial
+        # 3. TABLA 2: COMISIÓN ESPECIAL
         lbl_e = tk.Label(self.subtab_resumen_c, text="2. COMISIÓN ESPECIAL (CALCULADA SOBRE LA GANANCIA LÍQUIDA DE LA EMPRESA)", font=("Segoe UI", 9, "bold"), fg="#0056b3", anchor="w")
         lbl_e.pack(fill="x", padx=10, pady=(4, 2))
 
@@ -556,7 +600,7 @@ class AppComisionesOracle(tk.Tk):
         frame_e.pack(fill="x", padx=10, pady=2)
 
         cols_e = ("COD", "BENEFICIARIO", "GANANCIA_BASE", "PORC_APLICADO", "COMISION_PAGAR", "GANANCIA_FINAL")
-        self.tree_res_e = ttk.Treeview(frame_e, columns=cols_e, show="headings", height=3)
+        self.tree_res_e = ttk.Treeview(frame_e, columns=cols_e, show="headings", height=2)
 
         self.tree_res_e.heading("COD", text="Cód")
         self.tree_res_e.heading("BENEFICIARIO", text="Beneficiario Comisión Especial")
@@ -573,6 +617,19 @@ class AppComisionesOracle(tk.Tk):
         self.tree_res_e.column("GANANCIA_FINAL", width=200, anchor="e")
 
         self.tree_res_e.pack(fill="x")
+
+        # 4. PANEL CONSOLIDADO DINÁMICO (DASHBOARD)
+        self.frame_totales_contador = tk.Frame(self.subtab_resumen_c, bg="#212529", padx=15, pady=10)
+        self.frame_totales_contador.pack(fill="x", padx=10, pady=(8, 10))
+
+        self.lbl_tot_contador = tk.Label(
+            self.frame_totales_contador, 
+            text="TOTAL A LIQUIDAR: $0  |  MARGEN TOTAL: $0  |  GANANCIA NETA EMPRESA: $0", 
+            font=("Segoe UI", 9, "bold"), 
+            bg="#212529", 
+            fg="#28A745"
+        )
+        self.lbl_tot_contador.pack(anchor="w")
 
     def ordenar_resumen_por(self, col):
         if self.df_res_vendedores is None or self.df_res_vendedores.empty:
@@ -609,29 +666,115 @@ class AppComisionesOracle(tk.Tk):
                 f"${r['GANANCIA_NETA_EMPRESA']:,.0f}".replace(",", ".")
             ), tags=(tag,))
 
+    def aplicar_filtros_comisiones(self):
+        if self.df_comis_detalle is None or self.df_comis_detalle.empty:
+            return
+
+        df_f = self.df_comis_detalle.copy()
+
+        # 1. Filtro por Número de Documento
+        busq = self.entry_busq_c.get().strip().lstrip('0')
+        if busq:
+            df_f = df_f[df_f['NUMERO'].astype(str).str.lstrip('0').str.contains(busq, case=False, na=False)]
+
+        # 2. Filtro por Empleado
+        emp = self.combo_emp_c.get()
+        if emp and emp != "TODOS":
+            df_f = df_f[df_f['EMPLEADO'] == emp]
+
+        # 3. Filtro de Servicios y Productos
+        serv = self.combo_serv_c.get()
+        if "Doctos con Servicios" in serv:
+            df_f = df_f[df_f['TIENE_SERVICIO'] == 1]
+        elif "Solo Líneas de Servicio" in serv:
+            df_f = df_f[df_f['ES_SERVICIO'] == 1]
+        elif "Solo Repuestos" in serv:
+            df_f = df_f[df_f['ES_SERVICIO'] == 0]
+
+        # ---> ¡ESTA ES LA LÍNEA NUEVA! Guarda el filtro exacto para el Excel <---
+        self.df_comis_detalle_filtrado = df_f 
+
+        # Limpiar el Treeview actual
+        for i in self.tree_det_c.get_children():
+            self.tree_det_c.delete(i)
+
+        # Poblar nuevamente la tabla filtrada
+        for idx, (_, r) in enumerate(df_f.iterrows()):
+            es_nc = (r['TIPO_DOC'] == 'Nota Crédito' or str(r['TIPO_DOC_RAW']) == '61')
+            es_serv = r['ES_SERVICIO'] == 1
+
+            if es_nc:
+                tag_fila = 'nota_credito'
+            elif es_serv:
+                tag_fila = 'linea_servicio'
+            else:
+                tag_fila = 'fila_par' if idx % 2 == 0 else 'fila_impar'
+
+            self.tree_det_c.insert("", "end", values=(
+                r['TIPO_DOC'],
+                r['NUMERO'],
+                r['FECHA_DOC'],
+                r['EMPLEADO'],
+                r['ESTADO_DOC'],
+                r['NOMBRE_CLIENTE'],
+                r['PRODUCTO'],
+                f"{r['CANT']:.0f}",
+                f"${r['PRECIO_ORIG']:,.0f}".replace(",", "."),
+                f"${r['COSTO_UNITARIO']:,.0f}".replace(",", "."),
+                f"{r['DESC_PORC']:.1f}%",
+                f"${r['PRECIO_FINAL']:,.0f}".replace(",", "."),
+                f"${r['TOT_VENTA']:,.0f}".replace(",", "."),
+                f"${r['TOT_COSTO']:,.0f}".replace(",", "."),
+                f"${r['GANANCIA_TOTAL']:,.0f}".replace(",", "."),
+                f"{r['PORC_COMIS']:.2f}%",
+                f"${r['PAGO_EMPLEADO']:,.0f}".replace(",", "."),
+                f"${r['GANANCIA_EMPRESA']:,.0f}".replace(",", ".")
+            ), tags=(tag_fila,))
+
+        # Actualizar contador
+        self.lbl_conteo_c.config(text=f"Mostrando {len(df_f):,} de {len(self.df_comis_detalle):,} registros")
+
+    def limpiar_filtros_comisiones(self):
+        self.entry_busq_c.delete(0, tk.END)
+        self.combo_emp_c.set("TODOS")
+        self.combo_serv_c.set("TODOS")
+        self.aplicar_filtros_comisiones()
+
     def crear_vista_detalle_comisiones(self):
         frame_filtros = tk.Frame(self.subtab_detalle_c, bg="#ffffff", bd=1, relief="groove", padx=10, pady=6)
         frame_filtros.pack(fill="x", padx=5, pady=5)
 
         tk.Label(frame_filtros, text="🔍 Buscar N°:", bg="#ffffff", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(5, 2))
-        self.entry_busq_c = ttk.Entry(frame_filtros, width=15)
-        self.entry_busq_c.pack(side="left", padx=(0, 15))
+        self.entry_busq_c = ttk.Entry(frame_filtros, width=13)
+        self.entry_busq_c.pack(side="left", padx=(0, 10))
         self.entry_busq_c.bind("<KeyRelease>", lambda event: self.aplicar_filtros_comisiones())
 
         tk.Label(frame_filtros, text="👤 Empleado:", bg="#ffffff", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(5, 2))
-        self.combo_emp_c = ttk.Combobox(frame_filtros, width=28, state="readonly")
+        self.combo_emp_c = ttk.Combobox(frame_filtros, width=22, state="readonly")
         self.combo_emp_c.set("TODOS")
-        self.combo_emp_c.pack(side="left", padx=(0, 15))
+        self.combo_emp_c.pack(side="left", padx=(0, 10))
         self.combo_emp_c.bind("<<ComboboxSelected>>", lambda event: self.aplicar_filtros_comisiones())
+
+        # FILTRO DE SERVICIOS Y PRODUCTOS ASOCIADOS
+        tk.Label(frame_filtros, text="🛠️ Filtro Servicios:", bg="#ffffff", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(5, 2))
+        self.combo_serv_c = ttk.Combobox(
+            frame_filtros, 
+            values=["TODOS", "🔧 Doctos con Servicios (Servicio + Repuestos)", "⚙️ Solo Líneas de Servicio (SER)", "📦 Solo Repuestos / Productos"], 
+            width=32, 
+            state="readonly"
+        )
+        self.combo_serv_c.set("TODOS")
+        self.combo_serv_c.pack(side="left", padx=(0, 10))
+        self.combo_serv_c.bind("<<ComboboxSelected>>", lambda event: self.aplicar_filtros_comisiones())
 
         btn_limp = ttk.Button(frame_filtros, text="🧹 Limpiar", command=self.limpiar_filtros_comisiones)
         btn_limp.pack(side="left", padx=5)
 
-        btn_edit_c = tk.Button(frame_filtros, text="✏️ Modificar % Ganancia Fila", bg="#ffc107", fg="black", font=("Segoe UI", 8, "bold"), command=self.modal_editar_comision_seleccion)
-        btn_edit_c.pack(side="left", padx=15)
+        btn_edit_c = tk.Button(frame_filtros, text="✏️ Modificar % Ganancia", bg="#ffc107", fg="black", font=("Segoe UI", 8, "bold"), command=self.modal_editar_comision_seleccion)
+        btn_edit_c.pack(side="left", padx=10)
 
-        lbl_leyenda = tk.Label(frame_filtros, text="  Amarillo = NOTA DE CRÉDITO (Doble clic para ver Evidencia de Origen)  ", bg="#FFF3CD", fg="#856404", font=("Segoe UI", 8, "bold"), bd=1, relief="solid")
-        lbl_leyenda.pack(side="left", padx=15)
+        lbl_leyenda = tk.Label(frame_filtros, text="  Azul = SERVICIO | Amarillo = NC  ", bg="#E7F3FE", fg="#0C5460", font=("Segoe UI", 8, "bold"), bd=1, relief="solid")
+        lbl_leyenda.pack(side="left", padx=10)
 
         self.lbl_conteo_c = tk.Label(frame_filtros, text="", bg="#ffffff", fg="#6c757d", font=("Segoe UI", 9, "italic"))
         self.lbl_conteo_c.pack(side="right", padx=10)
@@ -639,7 +782,6 @@ class AppComisionesOracle(tk.Tk):
         frame_grid = ttk.Frame(self.subtab_detalle_c)
         frame_grid.pack(fill="both", expand=True, padx=5, pady=(0, 5))
 
-        # NUEVO ORDEN: Se eliminó Descripción y Vendedor está al lado de Fecha Doc
         self.cols_det_c = [
             ("TIPO_DOC", "Tipo Doc", 90, "center"),
             ("NUMERO", "Número", 85, "center"),
@@ -647,7 +789,7 @@ class AppComisionesOracle(tk.Tk):
             ("EMPLEADO", "Vendedor", 160, "w"),
             ("ESTADO_DOC", "Estado Doc", 155, "center"),
             ("NOMBRE_CLIENTE", "Cliente Comprador", 180, "w"),
-            ("PRODUCTO", "Producto", 110, "w"),
+            ("PRODUCTO", "Producto", 120, "w"),
             ("CANT", "Cant", 55, "center"),
             ("PRECIO_ORIG", "Precio Orig ($)", 105, "e"),
             ("COSTO_UNITARIO", "Costo ($)", 105, "e"),
@@ -669,6 +811,7 @@ class AppComisionesOracle(tk.Tk):
             self.tree_det_c.column(col_id, width=ancho, anchor=alineacion)
 
         self.tree_det_c.tag_configure('nota_credito', background='#FFF3CD', foreground='#856404')
+        self.tree_det_c.tag_configure('linea_servicio', background='#E7F3FE', foreground='#0C5460', font=("Segoe UI", 9, "bold"))
         self.tree_det_c.tag_configure('fila_par', background='#F8F9FA')
         self.tree_det_c.tag_configure('fila_impar', background='#FFFFFF')
 
@@ -994,10 +1137,11 @@ class AppComisionesOracle(tk.Tk):
         tree_hist_cli.pack(fill="both", expand=True, padx=5, pady=5)
 
     # ==========================================================
-    # MODAL: VISOR DE FACTURA / BOLETA CON CRUCE DE NOTAS DE CRÉDITO
+    # MODAL: VISOR DE FACTURA / BOLETA (SIN HISTORIAL DE NC)
     # ==========================================================
     def modal_visor_factura_con_nc(self, fila):
         tipo_doc = fila['TIPO_DOC']
+        tipo_doc_raw = fila['TIPO_DOC_RAW']
         num_doc = str(fila['NUMERO']).strip()
         rut_cli = str(fila['RUT_CLIENTE']).strip() if pd.notna(fila['RUT_CLIENTE']) else ""
         nom_cli = fila['NOMBRE_CLIENTE']
@@ -1006,7 +1150,7 @@ class AppComisionesOracle(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title(f"Visor de Detalle: {tipo_doc} N° {num_doc}")
-        win.geometry("1040x680")
+        win.geometry("1150x450") # Altura reducida ya que quitamos el historial de Notas de Crédito
         win.transient(self)
         win.grab_set()
 
@@ -1017,17 +1161,19 @@ class AppComisionesOracle(tk.Tk):
         tk.Label(frame_head, text=f"📄 DETALLE DE {tipo_doc.upper()} N° {num_doc}", font=("Segoe UI", 11, "bold"), bg="#0056b3", fg="white").pack(anchor="w")
         tk.Label(frame_head, text=f"Fecha: {fecha_doc}   |   Vendedor: {vendedor_doc}   |   Cliente: {nom_cli} (RUT: {rut_cli})", font=("Segoe UI", 9), bg="#0056b3", fg="#E2E3E5").pack(anchor="w", pady=(2, 0))
 
-        # Sección 1: Ítems de la Factura / Boleta
+        # Sección: Ítems de la Factura / Boleta
         frame_sec1 = tk.Frame(win, padx=10, pady=3)
         frame_sec1.pack(fill="x")
-        tk.Label(frame_sec1, text=f"1. Ítems Facturados en la {tipo_doc} N° {num_doc}:", font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(frame_sec1, text="Ítems Facturados (Doble clic en un producto para modificar su comisión):", font=("Segoe UI", 9, "bold")).pack(side="left")
 
-        btn_ajustar = tk.Button(frame_sec1, text="✏️ Ajustar % Comisión de este Documento", bg="#ffc107", fg="black", font=("Segoe UI", 8, "bold"), command=lambda: self.modal_editar_comision_seleccion())
+        # Botón para ajustar que ahora interactúa con la tabla interior
+        btn_ajustar = tk.Button(frame_sec1, text="✏️ Editar Comisión del Producto Seleccionado", bg="#ffc107", fg="black", font=("Segoe UI", 8, "bold"))
         btn_ajustar.pack(side="right")
 
-        cols_doc = ("PRODUCTO", "CANT", "PRECIO_FINAL", "COSTO", "TOT_VENTA", "GANANCIA", "% COMIS", "PAGO COMIS")
-        tree_doc = ttk.Treeview(win, columns=cols_doc, show="headings", height=5)
-        tree_doc.heading("PRODUCTO", text="Producto")
+        cols_doc = ("PRODUCTO", "DESCRIPCION", "CANT", "PRECIO_FINAL", "COSTO", "TOT_VENTA", "GANANCIA", "% COMIS", "PAGO COMIS")
+        tree_doc = ttk.Treeview(win, columns=cols_doc, show="headings", height=12)
+        tree_doc.heading("PRODUCTO", text="Cód Producto")
+        tree_doc.heading("DESCRIPCION", text="Descripción / Servicio")
         tree_doc.heading("CANT", text="Cant")
         tree_doc.heading("PRECIO_FINAL", text="Precio ($)")
         tree_doc.heading("COSTO", text="Costo ($)")
@@ -1036,19 +1182,27 @@ class AppComisionesOracle(tk.Tk):
         tree_doc.heading("% COMIS", text="% Comis")
         tree_doc.heading("PAGO COMIS", text="Comisión ($)")
 
-        tree_doc.column("PRODUCTO", width=120, anchor="w")
-        tree_doc.column("CANT", width=60, anchor="center")
-        tree_doc.column("PRECIO_FINAL", width=110, anchor="e")
-        tree_doc.column("COSTO", width=110, anchor="e")
-        tree_doc.column("TOT_VENTA", width=120, anchor="e")
-        tree_doc.column("GANANCIA", width=120, anchor="e")
-        tree_doc.column("% COMIS", width=80, anchor="center")
-        tree_doc.column("PAGO COMIS", width=120, anchor="e")
+        tree_doc.column("PRODUCTO", width=100, anchor="w")
+        tree_doc.column("DESCRIPCION", width=240, anchor="w")
+        tree_doc.column("CANT", width=50, anchor="center")
+        tree_doc.column("PRECIO_FINAL", width=95, anchor="e")
+        tree_doc.column("COSTO", width=95, anchor="e")
+        tree_doc.column("TOT_VENTA", width=105, anchor="e")
+        tree_doc.column("GANANCIA", width=105, anchor="e")
+        tree_doc.column("% COMIS", width=70, anchor="center")
+        tree_doc.column("PAGO COMIS", width=105, anchor="e")
 
-        lineas_doc = self.df_comis_detalle[self.df_comis_detalle['NUMERO'] == num_doc]
+        tree_doc.tag_configure('es_servicio', background='#E7F3FE', foreground='#0C5460', font=("Segoe UI", 9, "bold"))
+
+        lineas_doc = self.df_comis_detalle[(self.df_comis_detalle['NUMERO'] == num_doc) & (self.df_comis_detalle['TIPO_DOC_RAW'] == tipo_doc_raw)]
+        
         for _, r in lineas_doc.iterrows():
+            es_serv = str(r['PRODUCTO']).upper().startswith('SER')
+            tag_fila = 'es_servicio' if es_serv else ''
+            
             tree_doc.insert("", "end", values=(
                 r['PRODUCTO'],
+                r.get('DESCRIPCION_PRODUCTO', 'SIN DESCRIPCIÓN'),
                 f"{r['CANT']:.0f}",
                 f"${r['PRECIO_FINAL']:,.0f}".replace(",", "."),
                 f"${r['COSTO_UNITARIO']:,.0f}".replace(",", "."),
@@ -1056,93 +1210,104 @@ class AppComisionesOracle(tk.Tk):
                 f"${r['GANANCIA_TOTAL']:,.0f}".replace(",", "."),
                 f"{r['PORC_COMIS']:.2f}%",
                 f"${r['PAGO_EMPLEADO']:,.0f}".replace(",", ".")
-            ))
-        tree_doc.pack(fill="x", padx=10, pady=2)
-
-        # Sección 2: Cruce con Notas de Crédito Asociadas al Cliente
-        frame_sec2 = tk.Frame(win, padx=10, pady=(10, 2))
-        frame_sec2.pack(fill="x")
+            ), tags=(tag_fila,))
         
-        lbl_titulo_nc = tk.Label(frame_sec2, text="2. Notas de Crédito Asociadas a este Cliente en el Período:", font=("Segoe UI", 9, "bold"), fg="#856404")
-        lbl_titulo_nc.pack(side="left")
+        # Scrollbar por si hay muchas líneas en una sola factura
+        sb_y = ttk.Scrollbar(win, orient="vertical", command=tree_doc.yview)
+        tree_doc.configure(yscrollcommand=sb_y.set)
+        
+        tree_doc.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(2, 10))
+        sb_y.pack(side="left", fill="y", padx=(0, 10), pady=(2, 10))
 
-        frame_alerta_nc = tk.Frame(win, bg="#FFF3CD", bd=1, relief="solid", padx=10, pady=4)
-        lbl_alerta = tk.Label(frame_alerta_nc, text="", font=("Segoe UI", 9, "bold"), bg="#FFF3CD", fg="#856404")
-        lbl_alerta.pack(anchor="w")
+        # --- FUNCIONALIDAD INTERNA PARA EDITAR EL PRODUCTO SELECCIONADO ---
+        def editar_comision_producto(event=None):
+            sel = tree_doc.selection()
+            if not sel:
+                messagebox.showwarning("Atención", "Seleccione un producto de la lista para modificar su comisión.", parent=win)
+                return
+            
+            item_id = sel[0]
+            vals = tree_doc.item(item_id, "values")
+            prod_seleccionado = vals[0]
+            ganancia_str = vals[6]
+            comis_actual = vals[7]
 
-        cols_nc_asoc = ("TIPO", "NUM_NC", "FECHA_NC", "PRODUCTO", "CANT_DEV", "NETO_ANULADO", "MARGEN_RESTADO")
-        tree_nc_asoc = ttk.Treeview(win, columns=cols_nc_asoc, show="headings", height=5)
-        tree_nc_asoc.heading("TIPO", text="Tipo")
-        tree_nc_asoc.heading("NUM_NC", text="N° Nota Crédito")
-        tree_nc_asoc.heading("FECHA_NC", text="Fecha NC")
-        tree_nc_asoc.heading("PRODUCTO", text="Producto Devuelto")
-        tree_nc_asoc.heading("CANT_DEV", text="Cant Dev")
-        tree_nc_asoc.heading("NETO_ANULADO", text="Venta Restada ($)")
-        tree_nc_asoc.heading("MARGEN_RESTADO", text="Margen Restado ($)")
+            if hasattr(self, 'win_edicion_comis') and self.win_edicion_comis is not None and self.win_edicion_comis.winfo_exists():
+                self.win_edicion_comis.lift()
+                self.win_edicion_comis.focus_force()
+                return
 
-        tree_nc_asoc.column("TIPO", width=80, anchor="center")
-        tree_nc_asoc.column("NUM_NC", width=105, anchor="center")
-        tree_nc_asoc.column("FECHA_NC", width=90, anchor="center")
-        tree_nc_asoc.column("PRODUCTO", width=120, anchor="w")
-        tree_nc_asoc.column("CANT_DEV", width=70, anchor="center")
-        tree_nc_asoc.column("NETO_ANULADO", width=120, anchor="e")
-        tree_nc_asoc.column("MARGEN_RESTADO", width=120, anchor="e")
+            self.win_edicion_comis = tk.Toplevel(win)
+            self.win_edicion_comis.title(f"Ajustar % Comisión - Producto: {prod_seleccionado}")
+            self.win_edicion_comis.geometry("400x330")
+            self.win_edicion_comis.resizable(False, False)
+            self.win_edicion_comis.transient(win)
+            self.win_edicion_comis.grab_set()
 
-        try:
-            conn = get_oracle_connection()
-            clean_rut = str(rut_cli).upper().strip().replace('.', '').replace(' ', '').replace('/00', '').replace('-', '')
-            q_nc_cli = """
-            SELECT 
-                'Nota Crédito' AS tipo_doc,
-                d.numero_doc AS num_nc,
-                TO_CHAR(d.fecha, 'YYYY-MM-DD') AS fecha_nc,
-                d.cod_producto,
-                ABS(d.cantidad) AS cant_dev,
-                ROUND(ABS(d.cantidad) * d.precio * (1 - (NVL(d.descto, 0)/100.0)) * (1 - (NVL(doc.pdesct1, 0)/100.0)), 2) AS neto_anulado,
-                ROUND((ABS(d.cantidad) * d.precio * (1 - (NVL(d.descto, 0)/100.0)) * (1 - (NVL(doc.pdesct1, 0)/100.0))) - 
-                      (ABS(d.cantidad) * NVL(p.precio_costo, 0.0)), 2) AS margen_restado
-            FROM detalle_venta d
-            INNER JOIN documentos_venta doc 
-                ON d.tipo_doc = doc.tipo_doc AND d.numero_doc = doc.numero_doc
-            LEFT JOIN productos p ON d.cod_producto = p.cod_producto
-            WHERE d.tipo_doc = '61'
-              AND (
-                  TRIM(doc.rut_cliente) = :rut_raw 
-                  OR REPLACE(REPLACE(REPLACE(REPLACE(UPPER(TRIM(doc.rut_cliente)), '.', ''), ' ', ''), '/00', ''), '-', '') = :rut_clean
-              )
-            ORDER BY d.fecha DESC, d.numero_doc DESC
-            """
-            df_nc_asoc = pd.read_sql_query(q_nc_cli, conn, params={
-                'rut_raw': str(rut_cli).strip(),
-                'rut_clean': clean_rut
-            })
-            conn.close()
-            df_nc_asoc.columns = df_nc_asoc.columns.str.upper()
+            tk.Label(self.win_edicion_comis, text=f"Documento: {tipo_doc} N° {num_doc}", font=("Segoe UI", 10, "bold")).pack(pady=5)
+            tk.Label(self.win_edicion_comis, text=f"Vendedor: {vendedor_doc}", font=("Segoe UI", 9)).pack()
+            tk.Label(self.win_edicion_comis, text=f"Producto: {prod_seleccionado}", font=("Segoe UI", 9, "italic")).pack()
+            tk.Label(self.win_edicion_comis, text=f"Ganancia de esta línea: {ganancia_str}", font=("Segoe UI", 9, "bold"), fg="#007bff").pack(pady=5)
 
-            if df_nc_asoc.empty:
-                lbl_alerta.config(text="✅ Este cliente NO registra Notas de Crédito ni devoluciones.")
-                frame_alerta_nc.pack(fill="x", padx=10, pady=3)
-                tree_nc_asoc.insert("", "end", values=("INFO", "-", "-", "Sin devoluciones asociadas para este cliente", "", "", ""))
-            else:
-                tot_anulado = df_nc_asoc['NETO_ANULADO'].sum()
-                num_ncs_unicas = len(df_nc_asoc['NUM_NC'].unique())
-                lbl_alerta.config(text=f"⚠️ ATENCIÓN: Se encontraron {num_ncs_unicas} Nota(s) de Crédito para este cliente por un total restado de ${tot_anulado:,.0f}.".replace(",", "."))
-                frame_alerta_nc.pack(fill="x", padx=10, pady=3)
+            tk.Label(self.win_edicion_comis, text="Nuevo % de Comisión sobre Ganancia:").pack(pady=(5, 0))
+            entry_porc = ttk.Entry(self.win_edicion_comis, width=12)
+            entry_porc.insert(0, comis_actual.replace("%", ""))
+            entry_porc.pack()
+            entry_porc.focus_set()
 
-                for _, r in df_nc_asoc.iterrows():
-                    tree_nc_asoc.insert("", "end", values=(
-                        r['TIPO_DOC'],
-                        r['NUM_NC'],
-                        r['FECHA_NC'],
-                        r['COD_PRODUCTO'],
-                        f"{r['CANT_DEV']:.0f}",
-                        f"${r['NETO_ANULADO']:,.0f}".replace(",", "."),
-                        f"${r['MARGEN_RESTADO']:,.0f}".replace(",", ".")
-                    ))
-        except Exception as e:
-            tree_nc_asoc.insert("", "end", values=("ERROR", "-", "-", f"Error: {e}", "", "", ""))
+            var_alcance = tk.StringVar(value="LINEA")
+            rb1 = ttk.Radiobutton(self.win_edicion_comis, text=f"Aplicar solo a este producto ({prod_seleccionado})", variable=var_alcance, value="LINEA")
+            rb1.pack(anchor="w", padx=40, pady=(10, 2))
+            rb2 = ttk.Radiobutton(self.win_edicion_comis, text="Aplicar a TODOS los productos del documento", variable=var_alcance, value="DOCUMENTO")
+            rb2.pack(anchor="w", padx=40, pady=2)
 
-        tree_nc_asoc.pack(fill="both", expand=True, padx=10, pady=(2, 10))
+            def guardar():
+                try:
+                    nuevo_pct = float(entry_porc.get().strip())
+                    ajustes = []
+                    
+                    if var_alcance.get() == "LINEA":
+                        # Rescatar la línea exacta del DataFrame cargado
+                        linea_match = lineas_doc[lineas_doc['PRODUCTO'] == prod_seleccionado].iloc[0]
+                        ajustes.append({
+                            'tipo_doc': str(tipo_doc_raw), 
+                            'numero_doc': str(num_doc).strip(), 
+                            'cod_producto': str(prod_seleccionado).strip(), 
+                            'cod_vendedor': str(linea_match['COD_VENDEDOR']).strip(), 
+                            'porc_comis': float(nuevo_pct)
+                        })
+                    else:
+                        # Rescatar todas las líneas del documento
+                        for _, r_linea in lineas_doc.iterrows():
+                            ajustes.append({
+                                'tipo_doc': str(tipo_doc_raw), 
+                                'numero_doc': str(num_doc).strip(), 
+                                'cod_producto': str(r_linea['PRODUCTO']).strip(), 
+                                'cod_vendedor': str(r_linea['COD_VENDEDOR']).strip(), 
+                                'porc_comis': float(nuevo_pct)
+                            })
+
+                    # Ejecutar en un solo viaje a Oracle
+                    guardar_ajustes_multiples_oracle(ajustes)
+
+                    self.win_edicion_comis.destroy()
+                    win.destroy() # Cierra el visor de la factura
+                    
+                    # Recarga los datos y muestra el mensaje con un pequeño retraso para evitar congelamientos
+                    def recargar():
+                        self.ejecutar_consulta_completa()
+                        messagebox.showinfo("Guardado", f"Ajuste del {nuevo_pct}% guardado permanentemente.")
+                    
+                    self.after(50, recargar)
+                    
+                except ValueError:
+                    messagebox.showerror("Error", "Ingrese un número válido.", parent=self.win_edicion_comis)
+
+            tk.Button(self.win_edicion_comis, text="💾 Guardar en Base de Datos", bg="#28a745", fg="white", font=("Segoe UI", 9, "bold"), command=guardar).pack(pady=15)
+
+        # Enlazar el botón y el doble clic a la nueva función
+        btn_ajustar.config(command=editar_comision_producto)
+        tree_doc.bind("<Double-1>", editar_comision_producto)
 
     def modal_editar_comision_seleccion(self):
         seleccionados = self.tree_det_c.selection()
@@ -1152,9 +1317,14 @@ class AppComisionesOracle(tk.Tk):
 
         item_id = seleccionados[0]
         vals = self.tree_det_c.item(item_id, "values")
-        tipo_doc, num_doc, fecha, emp, estado, cli, prod, cant, p_orig, costo, desc_p, p_fin, tot_v, tot_c, ganancia, comis_actual, pago_e, gan_emp = vals
+        
+        # Extraer variables principales por índice según tu tabla
+        tipo_doc = vals[0]
+        num_doc = vals[1]
+        emp = vals[3]
+        prod_seleccionado = vals[6]
 
-        match = self.df_comis_detalle[(self.df_comis_detalle['NUMERO'] == num_doc) & (self.df_comis_detalle['PRODUCTO'] == prod)]
+        match = self.df_comis_detalle[(self.df_comis_detalle['NUMERO'] == num_doc) & (self.df_comis_detalle['PRODUCTO'] == prod_seleccionado)]
         if match.empty:
             return
         fila = match.iloc[0]
@@ -1179,10 +1349,14 @@ class AppComisionesOracle(tk.Tk):
         self.win_edicion_comis.transient(self)
         self.win_edicion_comis.grab_set()
 
+        # Rescatar variables exactas para la vista
+        ganancia_str = f"${fila['GANANCIA_TOTAL']:,.0f}".replace(",", ".")
+        comis_actual = f"{fila['PORC_COMIS']:.2f}%"
+
         tk.Label(self.win_edicion_comis, text=f"Documento: {tipo_doc} N° {num_doc}", font=("Segoe UI", 10, "bold")).pack(pady=5)
         tk.Label(self.win_edicion_comis, text=f"Vendedor: {emp}", font=("Segoe UI", 9)).pack()
-        tk.Label(self.win_edicion_comis, text=f"Producto: {prod}", font=("Segoe UI", 9, "italic")).pack()
-        tk.Label(self.win_edicion_comis, text=f"Ganancia / Margen de esta línea: {ganancia}", font=("Segoe UI", 9, "bold"), fg="#007bff").pack(pady=5)
+        tk.Label(self.win_edicion_comis, text=f"Producto: {prod_seleccionado}", font=("Segoe UI", 9, "italic")).pack()
+        tk.Label(self.win_edicion_comis, text=f"Ganancia / Margen de esta línea: {ganancia_str}", font=("Segoe UI", 9, "bold"), fg="#007bff").pack(pady=5)
 
         tk.Label(self.win_edicion_comis, text="Nuevo % de Comisión sobre Ganancia:").pack(pady=(5, 0))
         entry_porc = ttk.Entry(self.win_edicion_comis, width=12)
@@ -1191,7 +1365,7 @@ class AppComisionesOracle(tk.Tk):
         entry_porc.focus_set()
 
         var_alcance = tk.StringVar(value="LINEA")
-        rb1 = ttk.Radiobutton(self.win_edicion_comis, text=f"Aplicar solo a este producto ({prod})", variable=var_alcance, value="LINEA")
+        rb1 = ttk.Radiobutton(self.win_edicion_comis, text=f"Aplicar solo a este producto ({prod_seleccionado})", variable=var_alcance, value="LINEA")
         rb1.pack(anchor="w", padx=40, pady=(10, 2))
         rb2 = ttk.Radiobutton(self.win_edicion_comis, text=f"Aplicar a TODOS los productos de la {tipo_doc} N° {num_doc}", variable=var_alcance, value="DOCUMENTO")
         rb2.pack(anchor="w", padx=40, pady=2)
@@ -1199,16 +1373,38 @@ class AppComisionesOracle(tk.Tk):
         def guardar():
             try:
                 nuevo_pct = float(entry_porc.get().strip())
+                ajustes = []
+                
                 if var_alcance.get() == "LINEA":
-                    guardar_ajuste_oracle(fila['TIPO_DOC_RAW'], num_doc, prod, fila['COD_VENDEDOR'], nuevo_pct)
+                    ajustes.append({
+                        'tipo_doc': str(fila['TIPO_DOC_RAW']), 
+                        'numero_doc': str(num_doc).strip(), 
+                        'cod_producto': str(fila['PRODUCTO']).strip(), # Extraído de 'fila' en vez de la vista
+                        'cod_vendedor': str(fila['COD_VENDEDOR']).strip(), 
+                        'porc_comis': float(nuevo_pct)
+                    })
                 else:
                     lineas_doc = self.df_comis_detalle[self.df_comis_detalle['NUMERO'] == num_doc]
                     for _, r in lineas_doc.iterrows():
-                        guardar_ajuste_oracle(r['TIPO_DOC_RAW'], num_doc, r['PRODUCTO'], r['COD_VENDEDOR'], nuevo_pct)
+                        ajustes.append({
+                            'tipo_doc': str(r['TIPO_DOC_RAW']), 
+                            'numero_doc': str(num_doc).strip(), 
+                            'cod_producto': str(r['PRODUCTO']).strip(), 
+                            'cod_vendedor': str(r['COD_VENDEDOR']).strip(), 
+                            'porc_comis': float(nuevo_pct)
+                        })
+
+                # Ejecutar en un solo viaje a Oracle
+                guardar_ajustes_multiples_oracle(ajustes)
 
                 self.win_edicion_comis.destroy()
-                self.ejecutar_consulta_completa()
-                messagebox.showinfo("Guardado", f"Ajuste del {nuevo_pct}% guardado permanentemente en Oracle.")
+                
+                def recargar():
+                    self.ejecutar_consulta_completa()
+                    messagebox.showinfo("Guardado", f"Ajuste del {nuevo_pct}% guardado permanentemente.")
+                
+                self.after(50, recargar)
+                
             except ValueError:
                 messagebox.showerror("Error", "Ingrese un número válido.")
 
@@ -1241,9 +1437,9 @@ class AppComisionesOracle(tk.Tk):
         self.tree_cfg_esp.column("ESTADO", width=110, anchor="center")
         self.tree_cfg_esp.pack(fill="x", pady=4)
 
-        # 2. Panel de Gestión de Vendedores
+        # 2. Panel de Gestión de Vendedores (Ajustado para ocupar el resto de la pantalla)
         frame_ven_pozo = tk.LabelFrame(self.subtab_config_c, text=" 2. Gestión de Vendedores (Comisión Individual vs. Pozo Común) ", font=("Segoe UI", 9, "bold"), bg="#ffffff", padx=10, pady=6)
-        frame_ven_pozo.pack(fill="x", padx=15, pady=4)
+        frame_ven_pozo.pack(fill="both", expand=True, padx=15, pady=4)
 
         btn_toggle_pozo = tk.Button(frame_ven_pozo, text="🔄 Cambiar a Pozo / Individual", bg="#007bff", fg="white", font=("Segoe UI", 8, "bold"), command=self.toggle_vendedor_pozo)
         btn_toggle_pozo.pack(side="left", padx=5)
@@ -1252,7 +1448,7 @@ class AppComisionesOracle(tk.Tk):
         btn_edit_ven.pack(side="left", padx=5)
 
         cols_vp = ("COD", "NOMBRE", "TASA_GEN", "COMISIONA_IND")
-        self.tree_cfg_ven = ttk.Treeview(frame_ven_pozo, columns=cols_vp, show="headings", height=4)
+        self.tree_cfg_ven = ttk.Treeview(frame_ven_pozo, columns=cols_vp, show="headings") # Quitamos el height fijo
         self.tree_cfg_ven.heading("COD", text="Código")
         self.tree_cfg_ven.heading("NOMBRE", text="Nombre Vendedor")
         self.tree_cfg_ven.heading("TASA_GEN", text="Tasa General (%)")
@@ -1266,32 +1462,14 @@ class AppComisionesOracle(tk.Tk):
         self.tree_cfg_ven.tag_configure('ven_individual', background='#FFFFFF')
         self.tree_cfg_ven.tag_configure('ven_pozo', background='#E2E3E5', font=("Segoe UI", 9, "bold"))
 
-        self.tree_cfg_ven.pack(fill="x", pady=4)
+        # Scrollbar agregada a esta tabla que ahora es más grande
+        sb_ven = ttk.Scrollbar(frame_ven_pozo, orient="vertical", command=self.tree_cfg_ven.yview)
+        self.tree_cfg_ven.configure(yscrollcommand=sb_ven.set)
+        
+        self.tree_cfg_ven.pack(side="left", fill="both", expand=True, pady=4)
+        sb_ven.pack(side="right", fill="y", pady=4)
+        
         self.tree_cfg_ven.bind("<Double-1>", lambda event: self.toggle_vendedor_pozo())
-
-        # 3. Panel de Clientes TTM Service
-        frame_srv_cli = tk.LabelFrame(self.subtab_config_c, text=" 3. Clientes y RUTs Asociados a TTM Service (Taller) ", font=("Segoe UI", 9, "bold"), bg="#ffffff", padx=10, pady=6)
-        frame_srv_cli.pack(fill="both", expand=True, padx=15, pady=(4, 8))
-
-        btn_add_srv = tk.Button(frame_srv_cli, text="➕ Vincular RUT a TTM Service", bg="#6f42c1", fg="white", font=("Segoe UI", 8, "bold"), command=self.modal_vincular_cliente_service)
-        btn_add_srv.pack(side="left", padx=5)
-
-        btn_del_srv = tk.Button(frame_srv_cli, text="❌ Desvincular RUT", bg="#dc3545", fg="white", font=("Segoe UI", 8, "bold"), command=self.desvincular_cliente_service)
-        btn_del_srv.pack(side="left", padx=5)
-
-        btn_rel_srv = ttk.Button(frame_srv_cli, text="🔄 Recargar Panel", command=self.cargar_tablas_configuracion)
-        btn_rel_srv.pack(side="left", padx=15)
-
-        cols_s = ("RUT", "NOMBRE", "ESTADO")
-        self.tree_cfg_srv = ttk.Treeview(frame_srv_cli, columns=cols_s, show="headings", height=4)
-        self.tree_cfg_srv.heading("RUT", text="RUT Cliente")
-        self.tree_cfg_srv.heading("NOMBRE", text="Razón Social / Nombre")
-        self.tree_cfg_srv.heading("ESTADO", text="Estado")
-
-        self.tree_cfg_srv.column("RUT", width=140, anchor="center")
-        self.tree_cfg_srv.column("NOMBRE", width=380, anchor="w")
-        self.tree_cfg_srv.column("ESTADO", width=120, anchor="center")
-        self.tree_cfg_srv.pack(fill="both", expand=True, pady=4)
 
     def toggle_vendedor_pozo(self):
         item = self.tree_cfg_ven.selection()
@@ -1509,7 +1687,6 @@ class AppComisionesOracle(tk.Tk):
         )
         if archivo:
             try:
-                # Columnas ordenadas: Vendedor junto a Fecha, sin Descripción
                 cols_export = [
                     'TIPO_DOC', 'NUMERO', 'FECHA_DOC', 'EMPLEADO', 'ESTADO_DOC', 'NOMBRE_CLIENTE', 'PRODUCTO',
                     'CANT', 'PRECIO_ORIG', 'COSTO_UNITARIO', 'DESC_PORC', 'PRECIO_FINAL', 
@@ -1518,7 +1695,7 @@ class AppComisionesOracle(tk.Tk):
                 ]
 
                 cols_trunc_res = [
-                    'TOTAL_VENTAS_NETAS', 'TOTAL_NOTAS_CREDITO', 'GANANCIA_TOTAL_MARGEN', 
+                    'TOTAL_VENTAS_NETAS', 'TOTAL_NOTAS_CREDITO', 'TOTAL_COSTO', 'GANANCIA_TOTAL_MARGEN', 
                     'TOTAL_COMISION_PAGAR', 'GANANCIA_NETA_EMPRESA'
                 ]
                 df_res_ven_exp = truncar_columnas_df(self.df_res_vendedores, cols_trunc_res)
@@ -1533,29 +1710,71 @@ class AppComisionesOracle(tk.Tk):
                     'TOT_VENTA', 'TOT_COSTO', 'GANANCIA_TOTAL', 
                     'PAGO_EMPLEADO', 'GANANCIA_EMPRESA'
                 ]
-                df_det_exp = truncar_columnas_df(self.df_comis_detalle[cols_export], cols_trunc_det)
+                
+                # REGLA CLAVE: Si hay filtros aplicados, usar eso. Si no, usar la base de datos completa.
+                if hasattr(self, 'df_comis_detalle_filtrado') and self.df_comis_detalle_filtrado is not None:
+                    df_base_export = self.df_comis_detalle_filtrado
+                else:
+                    df_base_export = self.df_comis_detalle
+
+                df_det_exp = truncar_columnas_df(df_base_export[cols_export], cols_trunc_det)
 
                 with pd.ExcelWriter(archivo, engine="openpyxl") as writer:
                     df_res_ven_exp.to_excel(writer, sheet_name="Resumen_Vendedores", index=False)
                     if df_res_esp_exp is not None:
-                        df_res_esp_exp.to_excel(writer, sheet_name="Comision_Especial_Empresa", index=False)
-                    df_det_exp.to_excel(writer, sheet_name="Historial", index=False)
+                        df_res_esp_exp.to_excel(writer, sheet_name="Comision_Especial", index=False)
+                    df_det_exp.to_excel(writer, sheet_name="Detalle_Transacciones", index=False)
                     
-                    ws = writer.sheets['Historial']
-                    amarillo_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
-                    amarillo_font = Font(color="856404", bold=True)
-                    
-                    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(cols_export)):
-                        tipo_doc_celda = row[0].value
-                        if tipo_doc_celda == 'Nota Crédito':
-                            for cell in row:
-                                cell.fill = amarillo_fill
-                                if cell.column == 1 or cell.column == 5:
-                                    cell.font = amarillo_font
+                    # Dar formato PRO a todas las hojas del Excel
+                    workbook = writer.book
+                    for sheet_name in workbook.sheetnames:
+                        ws = workbook[sheet_name]
+                        
+                        # 1. Cabecera azul y negrita
+                        for cell in ws[1]:
+                            cell.font = Font(bold=True, color="FFFFFF")
+                            cell.fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+                        
+                        # 2. AUTO-AJUSTAR ANCHO DE COLUMNAS A LA PERFECCIÓN
+                        for col in ws.columns:
+                            max_length = 0
+                            column_letter = col[0].column_letter # Obtiene la letra de la columna (A, B, C...)
+                            for cell in col:
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+                            adjusted_width = (max_length + 2)
+                            ws.column_dimensions[column_letter].width = adjusted_width
 
-                messagebox.showinfo("Exportación Exitosa", f"Informe de comisiones guardado en:\n{archivo}")
+                        # 3. Colorear filas en el detalle
+                        if sheet_name == "Detalle_Transacciones":
+                            amarillo_fill = PatternFill(start_color="FFF3CD", end_color="FFF3CD", fill_type="solid")
+                            amarillo_font = Font(color="856404", bold=True)
+                            azul_fill = PatternFill(start_color="E7F3FE", end_color="E7F3FE", fill_type="solid")
+                            azul_font = Font(color="0C5460", bold=True)
+                            
+                            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(cols_export)):
+                                tipo_doc_celda = str(row[0].value)
+                                prod_celda = str(row[6].value).upper()
+                                
+                                es_nc = (tipo_doc_celda == 'Nota Crédito' or tipo_doc_celda == '61')
+                                es_serv = prod_celda.startswith('SER')
+                                
+                                if es_nc:
+                                    for cell in row:
+                                        cell.fill = amarillo_fill
+                                    row[0].font = amarillo_font
+                                    row[4].font = amarillo_font
+                                elif es_serv:
+                                    for cell in row:
+                                        cell.fill = azul_fill
+                                    row[6].font = azul_font
+
+                messagebox.showinfo("Exportación Exitosa", f"Informe ordenado con filtros exportado correctamente en:\n{archivo}")
             except Exception as e:
-                messagebox.showerror("Error", f"No se pudo guardar: {e}")
+                messagebox.showerror("Error", f"No se pudo guardar el archivo: {e}")
 
     def exportar_excel_service(self):
         if self.df_service_detalle is None or self.df_service_detalle.empty:
@@ -1607,29 +1826,7 @@ class AppComisionesOracle(tk.Tk):
             except Exception as e:
                 messagebox.showerror("Error", f"No se pudo guardar: {e}")
 
-    def modal_vincular_cliente_service(self):
-        try:
-            conn = get_oracle_connection()
-            df_c = pd.read_sql_query("SELECT rut_cliente, nombre FROM clientes ORDER BY nombre", conn)
-            conn.close()
-            df_c.columns = df_c.columns.str.upper()
-            clientes_lista = [f"{r['RUT_CLIENTE']} - {r['NOMBRE']}" for _, r in df_c.iterrows()]
-        except Exception as e:
-            messagebox.showerror("Error", f"Error al cargar clientes: {e}")
-            return
-
-        win = tk.Toplevel(self)
-        win.title("Vincular RUT a TTM Service")
-        win.geometry("450x200")
-        win.resizable(False, False)
-        win.transient(self)
-        win.grab_set()
-
-        tk.Label(win, text="Seleccione el Cliente / Razón Social de TTM Service:", font=("Segoe UI", 9, "bold")).pack(pady=(15, 5))
-        combo_c = ttk.Combobox(win, values=clientes_lista, width=42)
-        if clientes_lista:
-            combo_c.current(0)
-        combo_c.pack(pady=5)
+    
 
         def guardar():
             sel = combo_c.get()
@@ -1662,27 +1859,7 @@ class AppComisionesOracle(tk.Tk):
 
         tk.Button(win, text="💾 Vincular a TTM Service", bg="#6f42c1", fg="white", font=("Segoe UI", 9, "bold"), command=guardar).pack(pady=15)
 
-    def desvincular_cliente_service(self):
-        item = self.tree_cfg_srv.selection()
-        if not item:
-            messagebox.showwarning("Atención", "Seleccione un cliente de la lista.")
-            return
-        vals = self.tree_cfg_srv.item(item[0], "values")
-        rut, nom, estado = vals
-
-        if messagebox.askyesno("Confirmar", f"¿Desea desvincular a {nom} de TTM Service?"):
-            try:
-                conn = get_oracle_connection()
-                cursor = conn.cursor()
-                cursor.execute("UPDATE ttm_service_clientes SET activo = 0 WHERE rut_cliente = :rut", {'rut': rut})
-                conn.commit()
-                cursor.close()
-                conn.close()
-                self.cargar_tablas_configuracion()
-                self.recalcular_rapido_en_memoria()
-                messagebox.showinfo("Desvinculado", f"{nom} ha sido desvinculado.")
-            except Exception as e:
-                messagebox.showerror("Error al desvincular", f"Error: {e}")
+    
 
     def construir_subtabs_service(self):
         frame_top_s = tk.LabelFrame(self.tab_modulo_service, text=" Resumen Financiero Ventas a TTM Service ", font=("Segoe UI", 9, "bold"), bg="#ffffff", padx=15, pady=8)
@@ -1712,16 +1889,28 @@ class AppComisionesOracle(tk.Tk):
         frame_filtros_s = tk.Frame(self.tab_modulo_service, bg="#ffffff", bd=1, relief="groove", padx=10, pady=6)
         frame_filtros_s.pack(fill="x", padx=10, pady=(5, 5))
 
-        tk.Label(frame_filtros_s, text="🔍 Buscar Factura/Boleta N°:", bg="#ffffff", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(5, 2))
-        self.entry_busq_s = ttk.Entry(frame_filtros_s, width=15)
-        self.entry_busq_s.pack(side="left", padx=(0, 15))
+        tk.Label(frame_filtros_s, text="🔍 Buscar N°:", bg="#ffffff", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(5, 2))
+        self.entry_busq_s = ttk.Entry(frame_filtros_s, width=13)
+        self.entry_busq_s.pack(side="left", padx=(0, 10))
         self.entry_busq_s.bind("<KeyRelease>", lambda event: self.aplicar_filtros_service())
 
-        btn_limp_s = ttk.Button(frame_filtros_s, text="🧹 Limpiar Filtro", command=self.limpiar_filtros_service)
+        # ---> NUEVO FILTRO POR TIPO DE DOCUMENTO <---
+        tk.Label(frame_filtros_s, text="📄 Tipo:", bg="#ffffff", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(5, 2))
+        self.combo_tipo_s = ttk.Combobox(
+            frame_filtros_s, 
+            values=["TODOS", "Factura", "Boleta", "Nota Crédito"], 
+            width=15, 
+            state="readonly"
+        )
+        self.combo_tipo_s.set("TODOS")
+        self.combo_tipo_s.pack(side="left", padx=(0, 10))
+        self.combo_tipo_s.bind("<<ComboboxSelected>>", lambda event: self.aplicar_filtros_service())
+
+        btn_limp_s = ttk.Button(frame_filtros_s, text="🧹 Limpiar", command=self.limpiar_filtros_service)
         btn_limp_s.pack(side="left", padx=5)
 
         lbl_leyenda_s = tk.Label(frame_filtros_s, text="  Amarillo = NOTA DE CRÉDITO  ", bg="#FFF3CD", fg="#856404", font=("Segoe UI", 8, "bold"), bd=1, relief="solid")
-        lbl_leyenda_s.pack(side="left", padx=15)
+        lbl_leyenda_s.pack(side="left", padx=10)
 
         self.lbl_conteo_s = tk.Label(frame_filtros_s, text="", bg="#ffffff", fg="#6c757d", font=("Segoe UI", 9, "italic"))
         self.lbl_conteo_s.pack(side="right", padx=10)
@@ -1729,7 +1918,6 @@ class AppComisionesOracle(tk.Tk):
         frame_grid_s = ttk.Frame(self.tab_modulo_service)
         frame_grid_s.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # NUEVO ORDEN EN SERVICE: Vendedor al lado de Fecha, sin Descripción
         self.cols_srv_det = [
             ("TIPO_DOC", "Tipo Doc", 90, "center"),
             ("NUMERO", "Número", 85, "center"),
@@ -1771,54 +1959,7 @@ class AppComisionesOracle(tk.Tk):
         frame_grid_s.grid_rowconfigure(0, weight=1)
         frame_grid_s.grid_columnconfigure(0, weight=1)
 
-    def aplicar_filtros_comisiones(self):
-        if self.df_comis_detalle is None or self.df_comis_detalle.empty:
-            return
-
-        df_f = self.df_comis_detalle.copy()
-
-        busq = self.entry_busq_c.get().strip().lstrip('0')
-        if busq:
-            df_f = df_f[df_f['NUMERO'].astype(str).str.lstrip('0').str.contains(busq, case=False, na=False)]
-
-        emp = self.combo_emp_c.get()
-        if emp and emp != "TODOS":
-            df_f = df_f[df_f['EMPLEADO'] == emp]
-
-        for i in self.tree_det_c.get_children():
-            self.tree_det_c.delete(i)
-
-        for idx, (_, r) in enumerate(df_f.iterrows()):
-            es_nc = (r['TIPO_DOC'] == 'Nota Crédito' or str(r['TIPO_DOC_RAW']) == '61')
-            tag_fila = 'nota_credito' if es_nc else ('fila_par' if idx % 2 == 0 else 'fila_impar')
-
-            self.tree_det_c.insert("", "end", values=(
-                r['TIPO_DOC'],
-                r['NUMERO'],
-                r['FECHA_DOC'],
-                r['EMPLEADO'],
-                r['ESTADO_DOC'],
-                r['NOMBRE_CLIENTE'],
-                r['PRODUCTO'],
-                f"{r['CANT']:.0f}",
-                f"${r['PRECIO_ORIG']:,.0f}".replace(",", "."),
-                f"${r['COSTO_UNITARIO']:,.0f}".replace(",", "."),
-                f"{r['DESC_PORC']:.1f}%",
-                f"${r['PRECIO_FINAL']:,.0f}".replace(",", "."),
-                f"${r['TOT_VENTA']:,.0f}".replace(",", "."),
-                f"${r['TOT_COSTO']:,.0f}".replace(",", "."),
-                f"${r['GANANCIA_TOTAL']:,.0f}".replace(",", "."),
-                f"{r['PORC_COMIS']:.2f}%",
-                f"${r['PAGO_EMPLEADO']:,.0f}".replace(",", "."),
-                f"${r['GANANCIA_EMPRESA']:,.0f}".replace(",", ".")
-            ), tags=(tag_fila,))
-
-        self.lbl_conteo_c.config(text=f"Mostrando {len(df_f):,} de {len(self.df_comis_detalle):,} registros")
-
-    def limpiar_filtros_comisiones(self):
-        self.entry_busq_c.delete(0, tk.END)
-        self.combo_emp_c.set("TODOS")
-        self.aplicar_filtros_comisiones()
+        self.tree_det_s.bind("<Double-1>", self.on_double_click_detalle_service)
 
     def aplicar_filtros_service(self):
         if self.df_service_detalle is None or self.df_service_detalle.empty:
@@ -1826,9 +1967,15 @@ class AppComisionesOracle(tk.Tk):
 
         df_f = self.df_service_detalle.copy()
 
+        # 1. Filtro por Número de Documento
         busq = self.entry_busq_s.get().strip().lstrip('0')
         if busq:
             df_f = df_f[df_f['NUMERO'].astype(str).str.lstrip('0').str.contains(busq, case=False, na=False)]
+
+        # 2. Filtro por Tipo de Documento (Factura, Boleta, Nota Crédito)
+        tipo_sel = self.combo_tipo_s.get()
+        if tipo_sel and tipo_sel != "TODOS":
+            df_f = df_f[df_f['TIPO_DOC'] == tipo_sel]
 
         for i in self.tree_det_s.get_children():
             self.tree_det_s.delete(i)
@@ -1856,6 +2003,103 @@ class AppComisionesOracle(tk.Tk):
             ), tags=(tag_fila,))
 
         self.lbl_conteo_s.config(text=f"Mostrando {len(df_f):,} de {len(self.df_service_detalle):,} registros de TTM Service")
+
+    def limpiar_filtros_service(self):
+        self.entry_busq_s.delete(0, tk.END)
+        self.combo_tipo_s.set("TODOS")
+        self.aplicar_filtros_service()
+
+    # ==========================================================
+    # MODAL: AUDITORÍA PARA TTM SERVICE (DOBLE CLIC)
+    # ==========================================================
+    def on_double_click_detalle_service(self, event):
+        seleccionados = self.tree_det_s.selection()
+        if not seleccionados:
+            return
+
+        item_id = seleccionados[0]
+        vals = self.tree_det_s.item(item_id, "values")
+        tipo_doc, num_doc = vals[0], vals[1]
+        prod_seleccionado = vals[6]
+
+        # Buscar la línea en el dataframe exclusivo de Service
+        match = self.df_service_detalle[(self.df_service_detalle['NUMERO'] == num_doc) & (self.df_service_detalle['PRODUCTO'] == prod_seleccionado)]
+        if match.empty:
+            return
+        fila = match.iloc[0]
+
+        self.modal_visor_factura_service(fila)
+
+    def modal_visor_factura_service(self, fila):
+        tipo_doc = fila['TIPO_DOC']
+        tipo_doc_raw = fila['TIPO_DOC_RAW']
+        num_doc = str(fila['NUMERO']).strip()
+        nom_cli = fila['NOMBRE_CLIENTE']
+        fecha_doc = fila['FECHA_DOC']
+        vendedor_doc = fila['EMPLEADO']
+
+        win = tk.Toplevel(self)
+        win.title(f"Auditoría TTM Service: {tipo_doc} N° {num_doc}")
+        win.geometry("950x400")
+        win.transient(self)
+        win.grab_set()
+
+        # Cabecera Morada/Púrpura para identificar que es TTM Service
+        frame_head = tk.Frame(win, bg="#6f42c1", padx=15, pady=10) 
+        frame_head.pack(fill="x", padx=10, pady=(10, 5))
+
+        tk.Label(frame_head, text=f"🔧 DETALLE DE {tipo_doc.upper()} N° {num_doc} (TTM SERVICE)", font=("Segoe UI", 11, "bold"), bg="#6f42c1", fg="white").pack(anchor="w")
+        tk.Label(frame_head, text=f"Fecha: {fecha_doc}   |   Vendedor Interno: {vendedor_doc}   |   Cliente: {nom_cli}", font=("Segoe UI", 9), bg="#6f42c1", fg="#E2E3E5").pack(anchor="w", pady=(2, 0))
+
+        frame_sec1 = tk.Frame(win, padx=10, pady=3)
+        frame_sec1.pack(fill="x")
+        tk.Label(frame_sec1, text="Ítems transferidos en este documento (Servicios y Repuestos):", font=("Segoe UI", 9, "bold")).pack(side="left")
+
+        cols_doc = ("PRODUCTO", "DESCRIPCION", "CANT", "PRECIO_FINAL", "COSTO", "TOT_VENTA", "GANANCIA")
+        tree_doc = ttk.Treeview(win, columns=cols_doc, show="headings", height=10)
+        tree_doc.heading("PRODUCTO", text="Cód Producto")
+        tree_doc.heading("DESCRIPCION", text="Descripción / Servicio")
+        tree_doc.heading("CANT", text="Cant")
+        tree_doc.heading("PRECIO_FINAL", text="Precio Unit ($)")
+        tree_doc.heading("COSTO", text="Costo Unit ($)")
+        tree_doc.heading("TOT_VENTA", text="Total Venta ($)")
+        tree_doc.heading("GANANCIA", text="Margen ($)")
+
+        tree_doc.column("PRODUCTO", width=100, anchor="w")
+        tree_doc.column("DESCRIPCION", width=280, anchor="w")
+        tree_doc.column("CANT", width=60, anchor="center")
+        tree_doc.column("PRECIO_FINAL", width=110, anchor="e")
+        tree_doc.column("COSTO", width=110, anchor="e")
+        tree_doc.column("TOT_VENTA", width=120, anchor="e")
+        tree_doc.column("GANANCIA", width=120, anchor="e")
+
+        # Color celeste para destacar los servicios
+        tree_doc.tag_configure('es_servicio', background='#E7F3FE', foreground='#0C5460', font=("Segoe UI", 9, "bold"))
+
+        # Extraer todas las líneas de ESTE documento pero solo las que son de TTM Service
+        lineas_doc = self.df_service_detalle[(self.df_service_detalle['NUMERO'] == num_doc) & (self.df_service_detalle['TIPO_DOC_RAW'] == tipo_doc_raw)]
+        
+        for _, r in lineas_doc.iterrows():
+            es_serv = str(r['PRODUCTO']).upper().startswith('SER')
+            tag_fila = 'es_servicio' if es_serv else ''
+            
+            tree_doc.insert("", "end", values=(
+                r['PRODUCTO'],
+                r.get('DESCRIPCION_PRODUCTO', 'SIN DESCRIPCIÓN'),
+                f"{r['CANT']:.0f}",
+                f"${r['PRECIO_FINAL']:,.0f}".replace(",", "."),
+                f"${r['COSTO_UNITARIO']:,.0f}".replace(",", "."),
+                f"${r['TOT_VENTA']:,.0f}".replace(",", "."),
+                f"${r['GANANCIA_TOTAL']:,.0f}".replace(",", ".")
+            ), tags=(tag_fila,))
+        
+        sb_y = ttk.Scrollbar(win, orient="vertical", command=tree_doc.yview)
+        tree_doc.configure(yscrollcommand=sb_y.set)
+        
+        tree_doc.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(2, 10))
+        sb_y.pack(side="left", fill="y", padx=(0, 10), pady=(2, 10))
+
+
 
     def limpiar_filtros_service(self):
         self.entry_busq_s.delete(0, tk.END)
@@ -2000,6 +2244,8 @@ class AppComisionesOracle(tk.Tk):
             for item in self.tree_cfg_ven.get_children():
                 self.tree_cfg_ven.delete(item)
             df_v = pd.read_sql_query("SELECT cod_vendedor, nombre, tasa_general, NVL(comisiona_individual, 1) AS comisiona_individual FROM vendedores ORDER BY nombre", conn)
+            conn.close() # <-- La conexión se cierra aquí ahora
+            
             df_v.columns = df_v.columns.str.upper()
             for _, r in df_v.iterrows():
                 es_ind = (r['COMISIONA_INDIVIDUAL'] == 1)
@@ -2011,17 +2257,6 @@ class AppComisionesOracle(tk.Tk):
                     "SÍ (Comisión Individual)" if es_ind else "NO (Va a Pozo Común)"
                 ), tags=(tag_v,))
 
-            for item in self.tree_cfg_srv.get_children():
-                self.tree_cfg_srv.delete(item)
-            df_s = pd.read_sql_query("SELECT * FROM ttm_service_clientes ORDER BY nombre", conn)
-            conn.close()
-            df_s.columns = df_s.columns.str.upper()
-            for _, r in df_s.iterrows():
-                self.tree_cfg_srv.insert("", "end", values=(
-                    r['RUT_CLIENTE'],
-                    r['NOMBRE'],
-                    "ACTIVO" if r['ACTIVO'] == 1 else "INACTIVO"
-                ))
         except Exception as e:
             messagebox.showerror("Error", f"Error al leer configuración: {e}")
 
